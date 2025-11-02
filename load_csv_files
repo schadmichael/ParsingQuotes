@@ -1,0 +1,122 @@
+from __future__ import annotations
+from pathlib import Path
+import duckdb
+import time
+import os
+from typing import List, Optional, Tuple, Set
+
+def ingest_cftc_csvs(
+    folder: str,
+    db_path: str,
+    table: str,
+    keep_cols: Optional[List[str]] = None,
+    recursive: bool = False,
+) -> None:
+    """
+    Ingestion rapide et idempotente des fichiers CFTC_*.csv vers une base DuckDB (.db) avec historisation.
+
+    Args:
+        folder: dossier contenant les CSV.
+        db_path: chemin vers le fichier .db (DuckDB).
+        table: nom de la table d'historisation (append-only).
+        keep_cols: liste optionnelle de colonnes à conserver (sinon toutes).
+        recursive: True pour parcourir les sous-dossiers (glob **/CFTC_*.csv).
+    """
+    t0 = time.time()
+    src = Path(folder)
+    assert src.exists(), f"Dossier introuvable: {src}"
+
+    pattern = "**/CFTC_*.csv" if recursive else "CFTC_*.csv"
+    files = sorted(src.glob(pattern))
+    if not files:
+        print("Aucun fichier CFTC_*.csv trouvé.")
+        return
+
+    # Ouverture ou création de la base DuckDB
+    con = duckdb.connect(db_path)
+    con.execute("PRAGMA threads = " + str(os.cpu_count() or 4))
+
+    # Tables de destination et d'audit
+    con.execute(f"""
+        CREATE TABLE IF NOT EXISTS {table} AS
+        SELECT 1 AS _bootstrap
+        WHERE FALSE
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ingest_audit (
+            filename TEXT,
+            size BIGINT,
+            mtime_ns BIGINT,
+            loaded_at TIMESTAMP,
+            rows BIGINT,
+            PRIMARY KEY (filename, size, mtime_ns)
+        )
+    """)
+
+    # Audit existant pour ne pas retraiter les fichiers déjà chargés
+    existing: Set[Tuple[str, int, int]] = set(
+        con.execute("SELECT filename, size, mtime_ns FROM ingest_audit").fetchall()
+    )
+
+    # Sélection des nouveaux fichiers
+    to_load: List[Path] = []
+    metas: List[Tuple[str, int, int]] = []
+    for p in files:
+        st = p.stat()
+        key = (str(p.resolve()), st.st_size, st.st_mtime_ns)
+        if key not in existing:
+            to_load.append(p)
+            metas.append(key)
+
+    if not to_load:
+        print("Aucun nouveau fichier à traiter (audit à jour).")
+        con.close()
+        return
+
+    # Colonnes à garder
+    if keep_cols:
+        projection = ", ".join([f'"{c}"' for c in keep_cols])
+    else:
+        projection = "*"
+
+    # Initialisation du schéma si la table est vide
+    is_empty = con.execute(f"SELECT COUNT(*)=0 FROM {table}").fetchone()[0]
+    if is_empty:
+        first = str(to_load[0].resolve())
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {table} AS
+            SELECT {projection},
+                   filename AS source_file,
+                   now() AS load_ts
+            FROM read_csv_auto(?, SAMPLE_SIZE=-1, IGNORE_ERRORS=TRUE, filename=TRUE)
+            WHERE 1=0
+        """, [first])
+
+    # Chargement des nouveaux fichiers
+    file_list = [str(p.resolve()) for p in to_load]
+    con.execute(f"""
+        INSERT INTO {table}
+        SELECT {projection},
+               filename AS source_file,
+               now() AS load_ts
+        FROM read_csv_auto(?, SAMPLE_SIZE=-1, IGNORE_ERRORS=TRUE, filename=TRUE)
+    """, [file_list])
+
+    # Comptage des lignes par fichier
+    counts = con.execute("""
+        SELECT filename, COUNT(*) AS rows
+        FROM read_csv_auto(?, SAMPLE_SIZE=-1, IGNORE_ERRORS=TRUE, filename=TRUE)
+        GROUP BY 1
+    """, [file_list]).fetchall()
+    rows_by_file = {fn: r for (fn, r) in counts}
+
+    # Mise à jour de l'audit
+    con.executemany("""
+        INSERT OR IGNORE INTO ingest_audit(filename, size, mtime_ns, loaded_at, rows)
+        VALUES (?, ?, ?, now(), ?)
+    """, [(fn, sz, mt, int(rows_by_file.get(fn, 0))) for (fn, sz, mt) in metas])
+
+    con.close()
+    print(f"Ingestion terminée: {len(to_load)} nouveaux fichiers insérés dans {db_path}::{table}")
+    print(f"Durée totale: {time.time()-t0:.1f} secondes")
+    print("Colonnes techniques ajoutées: source_file, load_ts")
